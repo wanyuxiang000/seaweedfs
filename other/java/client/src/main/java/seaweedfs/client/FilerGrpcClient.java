@@ -2,46 +2,86 @@ package seaweedfs.client;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NegotiationType;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
-import io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
-import java.io.File;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Logger;
 
 public class FilerGrpcClient {
 
-    private static final Logger logger = Logger.getLogger(FilerGrpcClient.class.getName());
+    private static final Logger logger = LoggerFactory.getLogger(FilerGrpcClient.class);
+    static SslContext sslContext;
 
+    static {
+        try {
+            sslContext = FilerSslContext.loadSslContext();
+        } catch (SSLException e) {
+            logger.warn("failed to load ssl context", e);
+        }
+    }
+
+    public final int VOLUME_SERVER_ACCESS_DIRECT = 0;
+    public final int VOLUME_SERVER_ACCESS_PUBLIC_URL = 1;
+    public final int VOLUME_SERVER_ACCESS_FILER_PROXY = 2;
+    public final Map<String, FilerProto.Locations> vidLocations = new HashMap<>();
     private final ManagedChannel channel;
     private final SeaweedFilerGrpc.SeaweedFilerBlockingStub blockingStub;
     private final SeaweedFilerGrpc.SeaweedFilerStub asyncStub;
     private final SeaweedFilerGrpc.SeaweedFilerFutureStub futureStub;
-
+    private boolean cipher = false;
+    private String collection = "";
+    private String replication = "";
+    private int volumeServerAccess = VOLUME_SERVER_ACCESS_DIRECT;
+    private String filerAddress;
 
     public FilerGrpcClient(String host, int grpcPort) {
-        this(ManagedChannelBuilder.forAddress(host, grpcPort).usePlaintext());
+        this(host, grpcPort, sslContext);
     }
 
-    public FilerGrpcClient(String host, int grpcPort,
-                           String caFilePath,
-                           String clientCertFilePath,
-                           String clientPrivateKeyFilePath) throws SSLException {
+    public FilerGrpcClient(String host, int grpcPort, SslContext sslContext) {
 
-        this(NettyChannelBuilder.forAddress(host, grpcPort)
-                .negotiationType(NegotiationType.TLS)
-                .sslContext(buildSslContext(caFilePath,clientCertFilePath,clientPrivateKeyFilePath)));
+        this(sslContext == null ?
+                ManagedChannelBuilder.forAddress(host, grpcPort).usePlaintext()
+                        .maxInboundMessageSize(1024 * 1024 * 1024) :
+                NettyChannelBuilder.forAddress(host, grpcPort)
+                        .maxInboundMessageSize(1024 * 1024 * 1024)
+                        .negotiationType(NegotiationType.TLS)
+                        .sslContext(sslContext));
+
+        filerAddress = String.format("%s:%d", host, grpcPort - 10000);
+
+        FilerProto.GetFilerConfigurationResponse filerConfigurationResponse =
+                this.getBlockingStub().getFilerConfiguration(
+                        FilerProto.GetFilerConfigurationRequest.newBuilder().build());
+        cipher = filerConfigurationResponse.getCipher();
+        collection = filerConfigurationResponse.getCollection();
+        replication = filerConfigurationResponse.getReplication();
+
     }
 
-    public FilerGrpcClient(ManagedChannelBuilder<?> channelBuilder) {
+    private FilerGrpcClient(ManagedChannelBuilder<?> channelBuilder) {
         channel = channelBuilder.build();
         blockingStub = SeaweedFilerGrpc.newBlockingStub(channel);
         asyncStub = SeaweedFilerGrpc.newStub(channel);
         futureStub = SeaweedFilerGrpc.newFutureStub(channel);
+    }
+
+    public boolean isCipher() {
+        return cipher;
+    }
+
+    public String getCollection() {
+        return collection;
+    }
+
+    public String getReplication() {
+        return replication;
     }
 
     public void shutdown() throws InterruptedException {
@@ -60,17 +100,39 @@ public class FilerGrpcClient {
         return futureStub;
     }
 
-    private static SslContext buildSslContext(String trustCertCollectionFilePath,
-                                              String clientCertChainFilePath,
-                                              String clientPrivateKeyFilePath) throws SSLException {
-        SslContextBuilder builder = GrpcSslContexts.forClient();
-        if (trustCertCollectionFilePath != null) {
-            builder.trustManager(new File(trustCertCollectionFilePath));
+    public void setAccessVolumeServerDirectly() {
+        this.volumeServerAccess = VOLUME_SERVER_ACCESS_DIRECT;
+    }
+
+    public boolean isAccessVolumeServerDirectly() {
+        return this.volumeServerAccess == VOLUME_SERVER_ACCESS_DIRECT;
+    }
+
+    public void setAccessVolumeServerByPublicUrl() {
+        this.volumeServerAccess = VOLUME_SERVER_ACCESS_PUBLIC_URL;
+    }
+
+    public boolean isAccessVolumeServerByPublicUrl() {
+        return this.volumeServerAccess == VOLUME_SERVER_ACCESS_PUBLIC_URL;
+    }
+
+    public void setAccessVolumeServerByFilerProxy() {
+        this.volumeServerAccess = VOLUME_SERVER_ACCESS_FILER_PROXY;
+    }
+
+    public boolean isAccessVolumeServerByFilerProxy() {
+        return this.volumeServerAccess == VOLUME_SERVER_ACCESS_FILER_PROXY;
+    }
+
+    public String getChunkUrl(String chunkId, String url, String publicUrl) {
+        switch (this.volumeServerAccess) {
+            case VOLUME_SERVER_ACCESS_PUBLIC_URL:
+                return String.format("http://%s/%s", publicUrl, chunkId);
+            case VOLUME_SERVER_ACCESS_FILER_PROXY:
+                return String.format("http://%s/?proxyChunkId=%s", this.filerAddress, chunkId);
+            default:
+                return String.format("http://%s/%s", url, chunkId);
         }
-        if (clientCertChainFilePath != null && clientPrivateKeyFilePath != null) {
-            builder.keyManager(new File(clientCertChainFilePath), new File(clientPrivateKeyFilePath));
-        }
-        return builder.build();
     }
 
 }

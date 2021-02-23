@@ -3,15 +3,16 @@ package security
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"github.com/spf13/viper"
+	"github.com/chrislusf/seaweedfs/weed/util"
 	"io/ioutil"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+
+	"github.com/chrislusf/seaweedfs/weed/glog"
 )
 
-func LoadServerTLS(config *viper.Viper, component string) grpc.ServerOption {
+func LoadServerTLS(config *util.ViperProxy, component string) grpc.ServerOption {
 	if config == nil {
 		return nil
 	}
@@ -19,12 +20,12 @@ func LoadServerTLS(config *viper.Viper, component string) grpc.ServerOption {
 	// load cert/key, ca cert
 	cert, err := tls.LoadX509KeyPair(config.GetString(component+".cert"), config.GetString(component+".key"))
 	if err != nil {
-		glog.Errorf("load cert/key error: %v", err)
+		glog.V(1).Infof("load cert/key error: %v", err)
 		return nil
 	}
-	caCert, err := ioutil.ReadFile(config.GetString("ca"))
+	caCert, err := ioutil.ReadFile(config.GetString("grpc.ca"))
 	if err != nil {
-		glog.Errorf("read ca cert file error: %v", err)
+		glog.V(1).Infof("read ca cert file error: %v", err)
 		return nil
 	}
 	caCertPool := x509.NewCertPool()
@@ -38,20 +39,25 @@ func LoadServerTLS(config *viper.Viper, component string) grpc.ServerOption {
 	return grpc.Creds(ta)
 }
 
-func LoadClientTLS(config *viper.Viper, component string) grpc.DialOption {
+func LoadClientTLS(config *util.ViperProxy, component string) grpc.DialOption {
 	if config == nil {
 		return grpc.WithInsecure()
 	}
 
-	// load cert/key, cacert
-	cert, err := tls.LoadX509KeyPair(config.GetString(component+".cert"), config.GetString(component+".key"))
-	if err != nil {
-		glog.Errorf("load cert/key error: %v", err)
+	certFileName, keyFileName, caFileName := config.GetString(component+".cert"), config.GetString(component+".key"), config.GetString("grpc.ca")
+	if certFileName == "" || keyFileName == "" || caFileName == "" {
 		return grpc.WithInsecure()
 	}
-	caCert, err := ioutil.ReadFile(config.GetString("ca"))
+
+	// load cert/key, cacert
+	cert, err := tls.LoadX509KeyPair(certFileName, keyFileName)
 	if err != nil {
-		glog.Errorf("read ca cert file error: %v", err)
+		glog.V(1).Infof("load cert/key error: %v", err)
+		return grpc.WithInsecure()
+	}
+	caCert, err := ioutil.ReadFile(caFileName)
+	if err != nil {
+		glog.V(1).Infof("read ca cert file error: %v", err)
 		return grpc.WithInsecure()
 	}
 	caCertPool := x509.NewCertPool()

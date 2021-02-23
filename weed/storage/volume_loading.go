@@ -3,139 +3,175 @@ package storage
 import (
 	"fmt"
 	"os"
-	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/stats"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/stats"
+	"github.com/chrislusf/seaweedfs/weed/storage/backend"
+	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
+	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
-func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapType) (v *Volume, e error) {
+func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind) (v *Volume, err error) {
 	v = &Volume{dir: dirname, Collection: collection, Id: id}
-	v.SuperBlock = SuperBlock{}
+	v.SuperBlock = super_block.SuperBlock{}
 	v.needleMapKind = needleMapKind
-	e = v.load(false, false, needleMapKind, 0)
+	err = v.load(false, false, needleMapKind, 0)
 	return
 }
 
-func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapType, preallocate int64) error {
-	var e error
-	fileName := v.FileName()
+func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64) (err error) {
 	alreadyHasSuperBlock := false
 
-	if exists, canRead, canWrite, modifiedTime, fileSize := checkFile(fileName + ".dat"); exists {
+	hasLoadedVolume := false
+	defer func() {
+		if !hasLoadedVolume {
+			if v.nm != nil {
+				v.nm.Close()
+				v.nm = nil
+			}
+			if v.DataBackend != nil {
+				v.DataBackend.Close()
+				v.DataBackend = nil
+			}
+		}
+	}()
+
+	hasVolumeInfoFile := v.maybeLoadVolumeInfo() && v.volumeInfo.Version != 0
+
+	if v.HasRemoteFile() {
+		v.noWriteCanDelete = true
+		v.noWriteOrDelete = false
+		glog.V(0).Infof("loading volume %d from remote %v", v.Id, v.volumeInfo.Files)
+		v.LoadRemoteFile()
+		alreadyHasSuperBlock = true
+	} else if exists, canRead, canWrite, modifiedTime, fileSize := util.CheckFile(v.FileName(".dat")); exists {
+		// open dat file
 		if !canRead {
-			return fmt.Errorf("cannot read Volume Data file %s.dat", fileName)
+			return fmt.Errorf("cannot read Volume Data file %s", v.FileName(".dat"))
 		}
+		var dataFile *os.File
 		if canWrite {
-			v.dataFile, e = os.OpenFile(fileName+".dat", os.O_RDWR|os.O_CREATE, 0644)
-			v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
+			dataFile, err = os.OpenFile(v.FileName(".dat"), os.O_RDWR|os.O_CREATE, 0644)
 		} else {
-			glog.V(0).Infoln("opening " + fileName + ".dat in READONLY mode")
-			v.dataFile, e = os.Open(fileName + ".dat")
-			v.readOnly = true
+			glog.V(0).Infof("opening %s in READONLY mode", v.FileName(".dat"))
+			dataFile, err = os.Open(v.FileName(".dat"))
+			v.noWriteOrDelete = true
 		}
-		if fileSize >= _SuperBlockSize {
+		v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
+		if fileSize >= super_block.SuperBlockSize {
 			alreadyHasSuperBlock = true
 		}
+		v.DataBackend = backend.NewDiskFile(dataFile)
 	} else {
 		if createDatIfMissing {
-			v.dataFile, e = createVolumeFile(fileName+".dat", preallocate)
+			v.DataBackend, err = backend.CreateVolumeFile(v.FileName(".dat"), preallocate, v.MemoryMapMaxSizeMb)
 		} else {
-			return fmt.Errorf("Volume Data file %s.dat does not exist.", fileName)
+			return fmt.Errorf("volume data file %s does not exist", v.FileName(".dat"))
 		}
 	}
 
-	if e != nil {
-		if !os.IsPermission(e) {
-			return fmt.Errorf("cannot load Volume Data %s.dat: %v", fileName, e)
+	if err != nil {
+		if !os.IsPermission(err) {
+			return fmt.Errorf("cannot load volume data %s: %v", v.FileName(".dat"), err)
 		} else {
-			return fmt.Errorf("load data file %s.dat: %v", fileName, e)
+			return fmt.Errorf("load data file %s: %v", v.FileName(".dat"), err)
 		}
 	}
 
 	if alreadyHasSuperBlock {
-		e = v.readSuperBlock()
+		err = v.readSuperBlock()
 	} else {
-		e = v.maybeWriteSuperBlock()
+		if !v.SuperBlock.Initialized() {
+			return fmt.Errorf("volume %s not initialized", v.FileName(".dat"))
+		}
+		err = v.maybeWriteSuperBlock()
 	}
-	if e == nil && alsoLoadIndex {
+	if err == nil && alsoLoadIndex {
+		// adjust for existing volumes with .idx together with .dat files
+		if v.dirIdx != v.dir {
+			if util.FileExists(v.DataFileName() + ".idx") {
+				v.dirIdx = v.dir
+			}
+		}
+		// check volume idx files
+		if err := v.checkIdxFile(); err != nil {
+			glog.Fatalf("check volume idx file %s: %v", v.FileName(".idx"), err)
+		}
 		var indexFile *os.File
-		if v.readOnly {
-			glog.V(1).Infoln("open to read file", fileName+".idx")
-			if indexFile, e = os.OpenFile(fileName+".idx", os.O_RDONLY, 0644); e != nil {
-				return fmt.Errorf("cannot read Volume Index %s.idx: %v", fileName, e)
+		if v.noWriteOrDelete {
+			glog.V(0).Infoln("open to read file", v.FileName(".idx"))
+			if indexFile, err = os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644); err != nil {
+				return fmt.Errorf("cannot read Volume Index %s: %v", v.FileName(".idx"), err)
 			}
 		} else {
-			glog.V(1).Infoln("open to write file", fileName+".idx")
-			if indexFile, e = os.OpenFile(fileName+".idx", os.O_RDWR|os.O_CREATE, 0644); e != nil {
-				return fmt.Errorf("cannot write Volume Index %s.idx: %v", fileName, e)
+			glog.V(1).Infoln("open to write file", v.FileName(".idx"))
+			if indexFile, err = os.OpenFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE, 0644); err != nil {
+				return fmt.Errorf("cannot write Volume Index %s: %v", v.FileName(".idx"), err)
 			}
 		}
-		if v.lastAppendAtNs, e = CheckVolumeDataIntegrity(v, indexFile); e != nil {
-			v.readOnly = true
-			glog.V(0).Infof("volumeDataIntegrityChecking failed %v", e)
+		if v.lastAppendAtNs, err = CheckAndFixVolumeDataIntegrity(v, indexFile); err != nil {
+			v.noWriteOrDelete = true
+			glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
 		}
-		switch needleMapKind {
-		case NeedleMapInMemory:
-			glog.V(0).Infoln("loading index", fileName+".idx", "to memory readonly", v.readOnly)
-			if v.nm, e = LoadCompactNeedleMap(indexFile); e != nil {
-				glog.V(0).Infof("loading index %s to memory error: %v", fileName+".idx", e)
+
+		if v.noWriteOrDelete || v.noWriteCanDelete {
+			if v.nm, err = NewSortedFileNeedleMap(v.IndexFileName(), indexFile); err != nil {
+				glog.V(0).Infof("loading sorted db %s error: %v", v.FileName(".sdx"), err)
 			}
-		case NeedleMapLevelDb:
-			glog.V(0).Infoln("loading leveldb", fileName+".ldb")
-			opts := &opt.Options{
-				BlockCacheCapacity:            2 * 1024 * 1024, // default value is 8MiB
-				WriteBuffer:                   1 * 1024 * 1024, // default value is 4MiB
-				CompactionTableSizeMultiplier: 10,              // default value is 1
-			}
-			if v.nm, e = NewLevelDbNeedleMap(fileName+".ldb", indexFile, opts); e != nil {
-				glog.V(0).Infof("loading leveldb %s error: %v", fileName+".ldb", e)
-			}
-		case NeedleMapLevelDbMedium:
-			glog.V(0).Infoln("loading leveldb medium", fileName+".ldb")
-			opts := &opt.Options{
-				BlockCacheCapacity:            4 * 1024 * 1024, // default value is 8MiB
-				WriteBuffer:                   2 * 1024 * 1024, // default value is 4MiB
-				CompactionTableSizeMultiplier: 10,              // default value is 1
-			}
-			if v.nm, e = NewLevelDbNeedleMap(fileName+".ldb", indexFile, opts); e != nil {
-				glog.V(0).Infof("loading leveldb %s error: %v", fileName+".ldb", e)
-			}
-		case NeedleMapLevelDbLarge:
-			glog.V(0).Infoln("loading leveldb large", fileName+".ldb")
-			opts := &opt.Options{
-				BlockCacheCapacity:            8 * 1024 * 1024, // default value is 8MiB
-				WriteBuffer:                   4 * 1024 * 1024, // default value is 4MiB
-				CompactionTableSizeMultiplier: 10,              // default value is 1
-			}
-			if v.nm, e = NewLevelDbNeedleMap(fileName+".ldb", indexFile, opts); e != nil {
-				glog.V(0).Infof("loading leveldb %s error: %v", fileName+".ldb", e)
+		} else {
+			switch needleMapKind {
+			case NeedleMapInMemory:
+				glog.V(0).Infoln("loading index", v.FileName(".idx"), "to memory")
+				if v.nm, err = LoadCompactNeedleMap(indexFile); err != nil {
+					glog.V(0).Infof("loading index %s to memory error: %v", v.FileName(".idx"), err)
+				}
+			case NeedleMapLevelDb:
+				glog.V(0).Infoln("loading leveldb", v.FileName(".ldb"))
+				opts := &opt.Options{
+					BlockCacheCapacity:            2 * 1024 * 1024, // default value is 8MiB
+					WriteBuffer:                   1 * 1024 * 1024, // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,              // default value is 1
+				}
+				if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+				}
+			case NeedleMapLevelDbMedium:
+				glog.V(0).Infoln("loading leveldb medium", v.FileName(".ldb"))
+				opts := &opt.Options{
+					BlockCacheCapacity:            4 * 1024 * 1024, // default value is 8MiB
+					WriteBuffer:                   2 * 1024 * 1024, // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,              // default value is 1
+				}
+				if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+				}
+			case NeedleMapLevelDbLarge:
+				glog.V(0).Infoln("loading leveldb large", v.FileName(".ldb"))
+				opts := &opt.Options{
+					BlockCacheCapacity:            8 * 1024 * 1024, // default value is 8MiB
+					WriteBuffer:                   4 * 1024 * 1024, // default value is 4MiB
+					CompactionTableSizeMultiplier: 10,              // default value is 1
+				}
+				if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
+				}
 			}
 		}
+	}
+
+	if !hasVolumeInfoFile {
+		v.volumeInfo.Version = uint32(v.SuperBlock.Version)
+		v.SaveVolumeInfo()
 	}
 
 	stats.VolumeServerVolumeCounter.WithLabelValues(v.Collection, "volume").Inc()
 
-	return e
-}
+	if err == nil {
+		hasLoadedVolume = true
+	}
 
-func checkFile(filename string) (exists, canRead, canWrite bool, modTime time.Time, fileSize int64) {
-	exists = true
-	fi, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		exists = false
-		return
-	}
-	if fi.Mode()&0400 != 0 {
-		canRead = true
-	}
-	if fi.Mode()&0200 != 0 {
-		canWrite = true
-	}
-	modTime = fi.ModTime()
-	fileSize = fi.Size()
-	return
+	return err
 }

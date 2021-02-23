@@ -3,12 +3,13 @@ package weed_server
 import (
 	"context"
 	"fmt"
-
 	"github.com/chrislusf/raft"
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
+
 	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/storage"
 	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/chrislusf/seaweedfs/weed/storage/super_block"
 	"github.com/chrislusf/seaweedfs/weed/topology"
 )
 
@@ -52,7 +53,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	if req.Replication == "" {
 		req.Replication = ms.option.DefaultReplicaPlacement
 	}
-	replicaPlacement, err := storage.NewReplicaPlacementFromString(req.Replication)
+	replicaPlacement, err := super_block.NewReplicaPlacementFromString(req.Replication)
 	if err != nil {
 		return nil, err
 	}
@@ -60,24 +61,27 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	if err != nil {
 		return nil, err
 	}
+	diskType := types.ToDiskType(req.DiskType)
 
 	option := &topology.VolumeGrowOption{
-		Collection:       req.Collection,
-		ReplicaPlacement: replicaPlacement,
-		Ttl:              ttl,
-		Prealloacte:      ms.preallocateSize,
-		DataCenter:       req.DataCenter,
-		Rack:             req.Rack,
-		DataNode:         req.DataNode,
+		Collection:         req.Collection,
+		ReplicaPlacement:   replicaPlacement,
+		Ttl:                ttl,
+		DiskType:           diskType,
+		Prealloacte:        ms.preallocateSize,
+		DataCenter:         req.DataCenter,
+		Rack:               req.Rack,
+		DataNode:           req.DataNode,
+		MemoryMapMaxSizeMb: req.MemoryMapMaxSizeMb,
 	}
 
 	if !ms.Topo.HasWritableVolume(option) {
-		if ms.Topo.FreeSpace() <= 0 {
-			return nil, fmt.Errorf("No free volumes left!")
+		if ms.Topo.AvailableSpaceFor(option) <= 0 {
+			return nil, fmt.Errorf("no free volumes left for "+option.String())
 		}
 		ms.vgLock.Lock()
 		if !ms.Topo.HasWritableVolume(option) {
-			if _, err = ms.vg.AutomaticGrowByType(option, ms.grpcDialOpiton, ms.Topo); err != nil {
+			if _, err = ms.vg.AutomaticGrowByType(option, ms.grpcDialOption, ms.Topo, int(req.WritableVolumeCount)); err != nil {
 				ms.vgLock.Unlock()
 				return nil, fmt.Errorf("Cannot grow volume group! %v", err)
 			}
@@ -107,7 +111,7 @@ func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.Statistic
 	if req.Replication == "" {
 		req.Replication = ms.option.DefaultReplicaPlacement
 	}
-	replicaPlacement, err := storage.NewReplicaPlacementFromString(req.Replication)
+	replicaPlacement, err := super_block.NewReplicaPlacementFromString(req.Replication)
 	if err != nil {
 		return nil, err
 	}
@@ -116,11 +120,13 @@ func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.Statistic
 		return nil, err
 	}
 
-	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl)
+	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl, types.ToDiskType(req.DiskType))
 	stats := volumeLayout.Stats()
 
+	totalSize := ms.Topo.GetDiskUsages().GetMaxVolumeCount() * int64(ms.option.VolumeSizeLimitMB) * 1024 * 1024
+
 	resp := &master_pb.StatisticsResponse{
-		TotalSize: stats.TotalSize,
+		TotalSize: uint64(totalSize),
 		UsedSize:  stats.UsedSize,
 		FileCount: stats.FileCount,
 	}
@@ -175,12 +181,15 @@ func (ms *MasterServer) LookupEcVolume(ctx context.Context, req *master_pb.Looku
 	return resp, nil
 }
 
-func (ms *MasterServer) GetMasterConfiguration(ctx context.Context, req *master_pb.GetMasterConfigurationRequest) (*master_pb.GetMasterConfigurationResponse, error) {
+func (ms *MasterServer) VacuumVolume(ctx context.Context, req *master_pb.VacuumVolumeRequest) (*master_pb.VacuumVolumeResponse, error) {
 
-	resp := &master_pb.GetMasterConfigurationResponse{
-		MetricsAddress:         ms.option.MetricsAddress,
-		MetricsIntervalSeconds: uint32(ms.option.MetricsIntervalSec),
+	if !ms.Topo.IsLeader() {
+		return nil, raft.NotLeaderError
 	}
+
+	resp := &master_pb.VacuumVolumeResponse{}
+
+	ms.Topo.Vacuum(ms.grpcDialOption, float64(req.GarbageThreshold), ms.preallocateSize)
 
 	return resp, nil
 }

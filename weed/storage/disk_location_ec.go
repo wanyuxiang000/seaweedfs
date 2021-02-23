@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -13,7 +14,7 @@ import (
 )
 
 var (
-	re = regexp.MustCompile("\\.ec[0-9][0-9]")
+	re = regexp.MustCompile(`\.ec[0-9][0-9]`)
 )
 
 func (l *DiskLocation) FindEcVolume(vid needle.VolumeId) (*erasure_coding.EcVolume, bool) {
@@ -56,15 +57,18 @@ func (l *DiskLocation) FindEcShard(vid needle.VolumeId, shardId erasure_coding.S
 
 func (l *DiskLocation) LoadEcShard(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId) (err error) {
 
-	ecVolumeShard, err := erasure_coding.NewEcVolumeShard(l.Directory, collection, vid, shardId)
+	ecVolumeShard, err := erasure_coding.NewEcVolumeShard(l.DiskType, l.Directory, collection, vid, shardId)
 	if err != nil {
+		if err == os.ErrNotExist {
+			return os.ErrNotExist
+		}
 		return fmt.Errorf("failed to create ec shard %d.%d: %v", vid, shardId, err)
 	}
 	l.ecVolumesLock.Lock()
 	defer l.ecVolumesLock.Unlock()
 	ecVolume, found := l.ecVolumes[vid]
 	if !found {
-		ecVolume, err = erasure_coding.NewEcVolume(l.Directory, collection, vid)
+		ecVolume, err = erasure_coding.NewEcVolume(l.DiskType, l.Directory, l.IdxDirectory, collection, vid)
 		if err != nil {
 			return fmt.Errorf("failed to create ec volume %d: %v", vid, err)
 		}
@@ -118,6 +122,13 @@ func (l *DiskLocation) loadAllEcShards() (err error) {
 	if err != nil {
 		return fmt.Errorf("load all ec shards in dir %s: %v", l.Directory, err)
 	}
+	if l.IdxDirectory != l.Directory {
+		indexFileInfos, err := ioutil.ReadDir(l.IdxDirectory)
+		if err != nil {
+			return fmt.Errorf("load all ec shards in dir %s: %v", l.IdxDirectory, err)
+		}
+		fileInfos = append(fileInfos, indexFileInfos...)
+	}
 
 	sort.Slice(fileInfos, func(i, j int) bool {
 		return fileInfos[i].Name() < fileInfos[j].Name()
@@ -168,4 +179,25 @@ func (l *DiskLocation) deleteEcVolumeById(vid needle.VolumeId) (e error) {
 	ecVolume.Destroy()
 	delete(l.ecVolumes, vid)
 	return
+}
+
+func (l *DiskLocation) unmountEcVolumeByCollection(collectionName string) map[needle.VolumeId]*erasure_coding.EcVolume {
+	deltaVols := make(map[needle.VolumeId]*erasure_coding.EcVolume, 0)
+	for k, v := range l.ecVolumes {
+		if v.Collection == collectionName {
+			deltaVols[k] = v
+		}
+	}
+
+	for k, _ := range deltaVols {
+		delete(l.ecVolumes, k)
+	}
+	return deltaVols
+}
+
+func (l *DiskLocation) EcVolumesLen() int {
+	l.ecVolumesLock.RLock()
+	defer l.ecVolumesLock.RUnlock()
+
+	return len(l.ecVolumes)
 }

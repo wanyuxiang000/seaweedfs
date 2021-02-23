@@ -10,13 +10,15 @@ type EcVolumeInfo struct {
 	VolumeId   needle.VolumeId
 	Collection string
 	ShardBits  ShardBits
+	DiskType   string
 }
 
-func NewEcVolumeInfo(collection string, vid needle.VolumeId, shardBits ShardBits) *EcVolumeInfo {
+func NewEcVolumeInfo(diskType string, collection string, vid needle.VolumeId, shardBits ShardBits) *EcVolumeInfo {
 	return &EcVolumeInfo{
 		Collection: collection,
 		VolumeId:   vid,
 		ShardBits:  shardBits,
+		DiskType:   diskType,
 	}
 }
 
@@ -45,6 +47,7 @@ func (ecInfo *EcVolumeInfo) Minus(other *EcVolumeInfo) *EcVolumeInfo {
 		VolumeId:   ecInfo.VolumeId,
 		Collection: ecInfo.Collection,
 		ShardBits:  ecInfo.ShardBits.Minus(other.ShardBits),
+		DiskType:   ecInfo.DiskType,
 	}
 
 	return ret
@@ -55,6 +58,7 @@ func (ecInfo *EcVolumeInfo) ToVolumeEcShardInformationMessage() (ret *master_pb.
 		Id:          uint32(ecInfo.VolumeId),
 		EcIndexBits: uint32(ecInfo.ShardBits),
 		Collection:  ecInfo.Collection,
+		DiskType:    ecInfo.DiskType,
 	}
 }
 
@@ -81,6 +85,15 @@ func (b ShardBits) ShardIds() (ret []ShardId) {
 	return
 }
 
+func (b ShardBits) ToUint32Slice() (ret []uint32) {
+	for i := uint32(0); i < TotalShardsCount; i++ {
+		if b.HasShardId(ShardId(i)) {
+			ret = append(ret, i)
+		}
+	}
+	return
+}
+
 func (b ShardBits) ShardIdCount() (count int) {
 	for count = 0; b > 0; count++ {
 		b &= b - 1
@@ -94,4 +107,11 @@ func (b ShardBits) Minus(other ShardBits) ShardBits {
 
 func (b ShardBits) Plus(other ShardBits) ShardBits {
 	return b | other
+}
+
+func (b ShardBits) MinusParityShards() ShardBits {
+	for i := DataShardsCount; i < TotalShardsCount; i++ {
+		b = b.RemoveShardId(ShardId(i))
+	}
+	return b
 }

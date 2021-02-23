@@ -2,18 +2,22 @@ package topology
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 	"google.golang.org/grpc"
+
+	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/operation"
 	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
 )
 
-func batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList, garbageThreshold float64) bool {
-	ch := make(chan bool, locationlist.Length())
+func (t *Topology) batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vid needle.VolumeId,
+	locationlist *VolumeLocationList, garbageThreshold float64) (*VolumeLocationList, bool) {
+	ch := make(chan int, locationlist.Length())
+	errCount := int32(0)
 	for index, dn := range locationlist.list {
 		go func(index int, url string, vid needle.VolumeId) {
 			err := operation.WithVolumeServerClient(url, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
@@ -21,11 +25,15 @@ func batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vl *VolumeLayout, vi
 					VolumeId: uint32(vid),
 				})
 				if err != nil {
-					ch <- false
+					atomic.AddInt32(&errCount, 1)
+					ch <- -1
 					return err
 				}
-				isNeeded := resp.GarbageRatio > garbageThreshold
-				ch <- isNeeded
+				if resp.GarbageRatio >= garbageThreshold {
+					ch <- index
+				} else {
+					ch <- -1
+				}
 				return nil
 			})
 			if err != nil {
@@ -33,27 +41,37 @@ func batchVacuumVolumeCheck(grpcDialOption grpc.DialOption, vl *VolumeLayout, vi
 			}
 		}(index, dn.Url(), vid)
 	}
-	isCheckSuccess := true
-	for _ = range locationlist.list {
+	vacuumLocationList := NewVolumeLocationList()
+
+	waitTimeout := time.NewTimer(time.Minute * time.Duration(t.volumeSizeLimit/1024/1024/1000+1))
+	defer waitTimeout.Stop()
+
+	for range locationlist.list {
 		select {
-		case canVacuum := <-ch:
-			isCheckSuccess = isCheckSuccess && canVacuum
-		case <-time.After(30 * time.Minute):
-			isCheckSuccess = false
-			break
+		case index := <-ch:
+			if index != -1 {
+				vacuumLocationList.list = append(vacuumLocationList.list, locationlist.list[index])
+			}
+		case <-waitTimeout.C:
+			return vacuumLocationList, false
 		}
 	}
-	return isCheckSuccess
+	return vacuumLocationList, errCount == 0 && len(vacuumLocationList.list) > 0
 }
-func batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList, preallocate int64) bool {
+func (t *Topology) batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId,
+	locationlist *VolumeLocationList, preallocate int64) bool {
+	vl.accessLock.Lock()
 	vl.removeFromWritable(vid)
+	vl.accessLock.Unlock()
+
 	ch := make(chan bool, locationlist.Length())
 	for index, dn := range locationlist.list {
 		go func(index int, url string, vid needle.VolumeId) {
 			glog.V(0).Infoln(index, "Start vacuuming", vid, "on", url)
 			err := operation.WithVolumeServerClient(url, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 				_, err := volumeServerClient.VacuumVolumeCompact(context.Background(), &volume_server_pb.VacuumVolumeCompactRequest{
-					VolumeId: uint32(vid),
+					VolumeId:    uint32(vid),
+					Preallocate: preallocate,
 				})
 				return err
 			})
@@ -67,25 +85,32 @@ func batchVacuumVolumeCompact(grpcDialOption grpc.DialOption, vl *VolumeLayout, 
 		}(index, dn.Url(), vid)
 	}
 	isVacuumSuccess := true
-	for _ = range locationlist.list {
+
+	waitTimeout := time.NewTimer(3 * time.Minute * time.Duration(t.volumeSizeLimit/1024/1024/1000+1))
+	defer waitTimeout.Stop()
+
+	for range locationlist.list {
 		select {
 		case canCommit := <-ch:
 			isVacuumSuccess = isVacuumSuccess && canCommit
-		case <-time.After(30 * time.Minute):
-			isVacuumSuccess = false
-			break
+		case <-waitTimeout.C:
+			return false
 		}
 	}
 	return isVacuumSuccess
 }
-func batchVacuumVolumeCommit(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList) bool {
+func (t *Topology) batchVacuumVolumeCommit(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList) bool {
 	isCommitSuccess := true
+	isReadOnly := false
 	for _, dn := range locationlist.list {
 		glog.V(0).Infoln("Start Committing vacuum", vid, "on", dn.Url())
 		err := operation.WithVolumeServerClient(dn.Url(), grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-			_, err := volumeServerClient.VacuumVolumeCommit(context.Background(), &volume_server_pb.VacuumVolumeCommitRequest{
+			resp, err := volumeServerClient.VacuumVolumeCommit(context.Background(), &volume_server_pb.VacuumVolumeCommitRequest{
 				VolumeId: uint32(vid),
 			})
+			if resp != nil && resp.IsReadOnly {
+				isReadOnly = true
+			}
 			return err
 		})
 		if err != nil {
@@ -94,13 +119,15 @@ func batchVacuumVolumeCommit(grpcDialOption grpc.DialOption, vl *VolumeLayout, v
 		} else {
 			glog.V(0).Infof("Complete Committing vacuum %d on %s", vid, dn.Url())
 		}
-		if isCommitSuccess {
-			vl.SetVolumeAvailable(dn, vid)
+	}
+	if isCommitSuccess {
+		for _, dn := range locationlist.list {
+			vl.SetVolumeAvailable(dn, vid, isReadOnly)
 		}
 	}
 	return isCommitSuccess
 }
-func batchVacuumVolumeCleanup(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList) {
+func (t *Topology) batchVacuumVolumeCleanup(grpcDialOption grpc.DialOption, vl *VolumeLayout, vid needle.VolumeId, locationlist *VolumeLocationList) {
 	for _, dn := range locationlist.list {
 		glog.V(0).Infoln("Start cleaning up", vid, "on", dn.Url())
 		err := operation.WithVolumeServerClient(dn.Url(), grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
@@ -117,45 +144,54 @@ func batchVacuumVolumeCleanup(grpcDialOption grpc.DialOption, vl *VolumeLayout, 
 	}
 }
 
-func (t *Topology) Vacuum(grpcDialOption grpc.DialOption, garbageThreshold float64, preallocate int64) int {
+func (t *Topology) Vacuum(grpcDialOption grpc.DialOption, garbageThreshold float64, preallocate int64) {
+
+	// if there is vacuum going on, return immediately
+	swapped := atomic.CompareAndSwapInt64(&t.vacuumLockCounter, 0, 1)
+	if !swapped {
+		return
+	}
+	defer atomic.StoreInt64(&t.vacuumLockCounter, 0)
+
+	// now only one vacuum process going on
+
 	glog.V(1).Infof("Start vacuum on demand with threshold: %f", garbageThreshold)
 	for _, col := range t.collectionMap.Items() {
 		c := col.(*Collection)
 		for _, vl := range c.storageType2VolumeLayout.Items() {
 			if vl != nil {
 				volumeLayout := vl.(*VolumeLayout)
-				vacuumOneVolumeLayout(grpcDialOption, volumeLayout, c, garbageThreshold, preallocate)
+				t.vacuumOneVolumeLayout(grpcDialOption, volumeLayout, c, garbageThreshold, preallocate)
 			}
 		}
 	}
-	return 0
 }
 
-func vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeLayout *VolumeLayout, c *Collection, garbageThreshold float64, preallocate int64) {
+func (t *Topology) vacuumOneVolumeLayout(grpcDialOption grpc.DialOption, volumeLayout *VolumeLayout, c *Collection, garbageThreshold float64, preallocate int64) {
 
 	volumeLayout.accessLock.RLock()
 	tmpMap := make(map[needle.VolumeId]*VolumeLocationList)
 	for vid, locationList := range volumeLayout.vid2location {
-		tmpMap[vid] = locationList
+		tmpMap[vid] = locationList.Copy()
 	}
 	volumeLayout.accessLock.RUnlock()
 
 	for vid, locationList := range tmpMap {
 
 		volumeLayout.accessLock.RLock()
-		isReadOnly, hasValue := volumeLayout.readonlyVolumes[vid]
+		isReadOnly := volumeLayout.readonlyVolumes.IsTrue(vid)
 		volumeLayout.accessLock.RUnlock()
 
-		if hasValue && isReadOnly {
+		if isReadOnly {
 			continue
 		}
 
 		glog.V(2).Infof("check vacuum on collection:%s volume:%d", c.Name, vid)
-		if batchVacuumVolumeCheck(grpcDialOption, volumeLayout, vid, locationList, garbageThreshold) {
-			if batchVacuumVolumeCompact(grpcDialOption, volumeLayout, vid, locationList, preallocate) {
-				batchVacuumVolumeCommit(grpcDialOption, volumeLayout, vid, locationList)
+		if vacuumLocationList, needVacuum := t.batchVacuumVolumeCheck(grpcDialOption, vid, locationList, garbageThreshold); needVacuum {
+			if t.batchVacuumVolumeCompact(grpcDialOption, volumeLayout, vid, vacuumLocationList, preallocate) {
+				t.batchVacuumVolumeCommit(grpcDialOption, volumeLayout, vid, vacuumLocationList)
 			} else {
-				batchVacuumVolumeCleanup(grpcDialOption, volumeLayout, vid, locationList)
+				t.batchVacuumVolumeCleanup(grpcDialOption, volumeLayout, vid, vacuumLocationList)
 			}
 		}
 	}

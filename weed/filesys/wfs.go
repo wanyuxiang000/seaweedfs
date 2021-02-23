@@ -3,53 +3,82 @@ package filesys
 import (
 	"context"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/filer"
+	"github.com/chrislusf/seaweedfs/weed/storage/types"
+	"github.com/chrislusf/seaweedfs/weed/wdclient"
 	"math"
 	"os"
+	"path"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/chrislusf/seaweedfs/weed/util/grace"
+
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
+
+	"github.com/chrislusf/seaweedfs/weed/filesys/meta_cache"
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/karlseguin/ccache"
-	"github.com/seaweedfs/fuse"
-	"github.com/seaweedfs/fuse/fs"
-	"google.golang.org/grpc"
+	"github.com/chrislusf/seaweedfs/weed/util/chunk_cache"
 )
 
 type Option struct {
+	MountDirectory     string
+	FilerAddress       string
 	FilerGrpcAddress   string
 	GrpcDialOption     grpc.DialOption
 	FilerMountRootPath string
 	Collection         string
 	Replication        string
 	TtlSec             int32
+	DiskType           types.DiskType
 	ChunkSizeLimit     int64
+	ConcurrentWriters  int
+	CacheDir           string
+	CacheSizeMB        int64
 	DataCenter         string
-	DirListingLimit    int
 	EntryCacheTtl      time.Duration
+	Umask              os.FileMode
 
 	MountUid   uint32
 	MountGid   uint32
 	MountMode  os.FileMode
 	MountCtime time.Time
 	MountMtime time.Time
+
+	VolumeServerAccess string // how to access volume servers
+	Cipher             bool   // whether encrypt data on volume server
+	UidGidMapper       *meta_cache.UidGidMapper
 }
 
 var _ = fs.FS(&WFS{})
 var _ = fs.FSStatfser(&WFS{})
 
 type WFS struct {
-	option                    *Option
-	listDirectoryEntriesCache *ccache.Cache
+	option *Option
 
-	// contains all open handles
-	handles           []*FileHandle
-	pathToHandleIndex map[string]int
-	pathToHandleLock  sync.Mutex
-	bufPool           sync.Pool
+	// contains all open handles, protected by handlesLock
+	handlesLock sync.Mutex
+	handles     map[uint64]*FileHandle
+
+	bufPool sync.Pool
 
 	stats statsCache
+
+	root        fs.Node
+	fsNodeCache *FsCache
+
+	chunkCache *chunk_cache.TieredChunkCache
+	metaCache  *meta_cache.MetaCache
+	signature  int32
+
+	// throttle writers
+	concurrentWriters *util.LimitedConcurrentExecutor
+	Server            *fs.Server
 }
 type statsCache struct {
 	filer_pb.StatisticsResponse
@@ -58,72 +87,98 @@ type statsCache struct {
 
 func NewSeaweedFileSystem(option *Option) *WFS {
 	wfs := &WFS{
-		option:                    option,
-		listDirectoryEntriesCache: ccache.New(ccache.Configure().MaxSize(1024 * 8).ItemsToPrune(100)),
-		pathToHandleIndex:         make(map[string]int),
+		option:  option,
+		handles: make(map[uint64]*FileHandle),
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, option.ChunkSizeLimit)
 			},
 		},
+		signature: util.RandomInt32(),
+	}
+	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + option.FilerGrpcAddress + option.FilerMountRootPath + util.Version()))[0:8]
+	cacheDir := path.Join(option.CacheDir, cacheUniqueId)
+	if option.CacheSizeMB > 0 {
+		os.MkdirAll(cacheDir, os.FileMode(0777)&^option.Umask)
+		wfs.chunkCache = chunk_cache.NewTieredChunkCache(256, cacheDir, option.CacheSizeMB, 1024*1024)
+	}
+
+	wfs.metaCache = meta_cache.NewMetaCache(path.Join(cacheDir, "meta"), util.FullPath(option.FilerMountRootPath), option.UidGidMapper, func(filePath util.FullPath) {
+		fsNode := wfs.fsNodeCache.GetFsNode(filePath)
+		if fsNode != nil {
+			if file, ok := fsNode.(*File); ok {
+				if err := wfs.Server.InvalidateNodeData(file); err != nil {
+					glog.V(4).Infof("InvalidateNodeData %s : %v", filePath, err)
+				}
+				file.clearEntry()
+			}
+		}
+		dir, name := filePath.DirAndName()
+		parent := wfs.root
+		if dir != "/" {
+			parent = wfs.fsNodeCache.GetFsNode(util.FullPath(dir))
+		}
+		if parent != nil {
+			if err := wfs.Server.InvalidateEntry(parent, name); err != nil {
+				glog.V(4).Infof("InvalidateEntry %s : %v", filePath, err)
+			}
+		}
+	})
+	startTime := time.Now()
+	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano())
+	grace.OnInterrupt(func() {
+		wfs.metaCache.Shutdown()
+	})
+
+	entry, _ := filer_pb.GetEntry(wfs, util.FullPath(wfs.option.FilerMountRootPath))
+	wfs.root = &Dir{name: wfs.option.FilerMountRootPath, wfs: wfs, entry: entry}
+	wfs.fsNodeCache = newFsCache(wfs.root)
+
+	if wfs.option.ConcurrentWriters > 0 {
+		wfs.concurrentWriters = util.NewLimitedConcurrentExecutor(wfs.option.ConcurrentWriters)
 	}
 
 	return wfs
 }
 
 func (wfs *WFS) Root() (fs.Node, error) {
-	return &Dir{Path: wfs.option.FilerMountRootPath, wfs: wfs}, nil
-}
-
-func (wfs *WFS) WithFilerClient(ctx context.Context, fn func(filer_pb.SeaweedFilerClient) error) error {
-
-	return util.WithCachedGrpcClient(ctx, func(grpcConnection *grpc.ClientConn) error {
-		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
-		return fn(client)
-	}, wfs.option.FilerGrpcAddress, wfs.option.GrpcDialOption)
-
+	return wfs.root, nil
 }
 
 func (wfs *WFS) AcquireHandle(file *File, uid, gid uint32) (fileHandle *FileHandle) {
-	wfs.pathToHandleLock.Lock()
-	defer wfs.pathToHandleLock.Unlock()
 
 	fullpath := file.fullpath()
+	glog.V(4).Infof("AcquireHandle %s uid=%d gid=%d", fullpath, uid, gid)
 
-	index, found := wfs.pathToHandleIndex[fullpath]
-	if found && wfs.handles[index] != nil {
-		glog.V(2).Infoln(fullpath, "found fileHandle id", index)
-		return wfs.handles[index]
-	}
+	wfs.handlesLock.Lock()
+	defer wfs.handlesLock.Unlock()
 
-	fileHandle = newFileHandle(file, uid, gid)
-	for i, h := range wfs.handles {
-		if h == nil {
-			wfs.handles[i] = fileHandle
-			fileHandle.handle = uint64(i)
-			wfs.pathToHandleIndex[fullpath] = i
-			glog.V(4).Infoln(fullpath, "reuse fileHandle id", fileHandle.handle)
-			return
+	inodeId := file.fullpath().AsInode()
+	if file.isOpen > 0 {
+		existingHandle, found := wfs.handles[inodeId]
+		if found && existingHandle != nil {
+			file.isOpen++
+			return existingHandle
 		}
 	}
 
-	wfs.handles = append(wfs.handles, fileHandle)
-	fileHandle.handle = uint64(len(wfs.handles) - 1)
-	glog.V(2).Infoln(fullpath, "new fileHandle id", fileHandle.handle)
-	wfs.pathToHandleIndex[fullpath] = int(fileHandle.handle)
+	fileHandle = newFileHandle(file, uid, gid)
+	file.maybeLoadEntry(context.Background())
+	file.isOpen++
+
+	wfs.handles[inodeId] = fileHandle
+	fileHandle.handle = inodeId
 
 	return
 }
 
-func (wfs *WFS) ReleaseHandle(fullpath string, handleId fuse.HandleID) {
-	wfs.pathToHandleLock.Lock()
-	defer wfs.pathToHandleLock.Unlock()
+func (wfs *WFS) ReleaseHandle(fullpath util.FullPath, handleId fuse.HandleID) {
+	wfs.handlesLock.Lock()
+	defer wfs.handlesLock.Unlock()
 
-	glog.V(4).Infof("%s releasing handle id %d current handles length %d", fullpath, handleId, len(wfs.handles))
-	delete(wfs.pathToHandleIndex, fullpath)
-	if int(handleId) < len(wfs.handles) {
-		wfs.handles[int(handleId)] = nil
-	}
+	glog.V(4).Infof("%s ReleaseHandle id %d current handles length %d", fullpath, handleId, len(wfs.handles))
+
+	delete(wfs.handles, fullpath.AsInode())
 
 	return
 }
@@ -135,16 +190,17 @@ func (wfs *WFS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.
 
 	if wfs.stats.lastChecked < time.Now().Unix()-20 {
 
-		err := wfs.WithFilerClient(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		err := wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 
 			request := &filer_pb.StatisticsRequest{
 				Collection:  wfs.option.Collection,
 				Replication: wfs.option.Replication,
 				Ttl:         fmt.Sprintf("%ds", wfs.option.TtlSec),
+				DiskType:    string(wfs.option.DiskType),
 			}
 
 			glog.V(4).Infof("reading filer stats: %+v", request)
-			resp, err := client.Statistics(ctx, request)
+			resp, err := client.Statistics(context.Background(), request)
 			if err != nil {
 				glog.V(0).Infof("reading filer stats %v: %v", request, err)
 				return err
@@ -188,4 +244,27 @@ func (wfs *WFS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.
 	resp.Frsize = uint32(blockSize)
 
 	return nil
+}
+
+func (wfs *WFS) mapPbIdFromFilerToLocal(entry *filer_pb.Entry) {
+	if entry.Attributes == nil {
+		return
+	}
+	entry.Attributes.Uid, entry.Attributes.Gid = wfs.option.UidGidMapper.FilerToLocal(entry.Attributes.Uid, entry.Attributes.Gid)
+}
+func (wfs *WFS) mapPbIdFromLocalToFiler(entry *filer_pb.Entry) {
+	if entry.Attributes == nil {
+		return
+	}
+	entry.Attributes.Uid, entry.Attributes.Gid = wfs.option.UidGidMapper.LocalToFiler(entry.Attributes.Uid, entry.Attributes.Gid)
+}
+
+func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
+	if wfs.option.VolumeServerAccess == "filerProxy" {
+		return func(fileId string) (targetUrls []string, err error) {
+			return []string{"http://" + wfs.option.FilerAddress + "/?proxyChunkId=" + fileId}, nil
+		}
+	}
+	return filer.LookupFn(wfs)
+
 }

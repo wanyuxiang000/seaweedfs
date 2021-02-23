@@ -5,5 +5,10 @@ import (
 )
 
 var (
-	VERSION = fmt.Sprintf("%s %d.%d", sizeLimit, 1, 41)
+	VERSION = fmt.Sprintf("%s %d.%02d", sizeLimit, 2, 27)
+	COMMIT  = ""
 )
+
+func Version() string {
+	return VERSION + " " + COMMIT
+}

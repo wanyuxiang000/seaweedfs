@@ -76,6 +76,7 @@ var StatusTpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
               <th>Rack</th>
               <th>RemoteAddr</th>
               <th>#Volumes</th>
+              <th>Volume Ids</th>
               <th>#ErasureCodingShards</th>
               <th>Max</th>
             </tr>
@@ -87,8 +88,13 @@ var StatusTpl = template.Must(template.New("status").Parse(`<!DOCTYPE html>
             <tr>
               <td><code>{{ $dc.Id }}</code></td>
               <td>{{ $rack.Id }}</td>
-              <td><a href="http://{{ $dn.Url }}/ui/index.html">{{ $dn.Url }}</a></td>
+              <td><a href="http://{{ $dn.Url }}/ui/index.html">{{ $dn.Url }}</a> 
+                {{ if ne $dn.PublicUrl $dn.Url }}
+					/ <a href="http://{{ $dn.PublicUrl }}/ui/index.html">{{ $dn.PublicUrl }}</a> 
+                {{ end }}
+			  </td>
               <td>{{ $dn.Volumes }}</td>
+              <td>{{ $dn.VolumeIds}}</td>
               <td>{{ $dn.EcShards }}</td>
               <td>{{ $dn.Max }}</td>
             </tr>
